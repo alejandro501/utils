@@ -1,0 +1,24 @@
+# .gitignore
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.env/
+
+# IDE files
+.idea/
+.vscode/
+
+# Logs and databases
+*.log
+*.sqlite
+
+# Postman collections
+*_backup.json
+*_original.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
