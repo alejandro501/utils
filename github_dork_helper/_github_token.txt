@@ -1,1 +1,1 @@
-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
+example_token
