@@ -3,27 +3,39 @@ import re
 import requests
 import time
 import socket
+import shutil
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote_plus
 
-# Configuration (unchanged)
+# Configuration
 GITHUB_TOKEN_FILE = "_github_token.txt"
 HITS_MINIMAL = "_hits.txt"
 HITS_VERBOSE = "_hits_verbose.txt"
+PROCESSED_FOLDER = "processed"
 MAX_RETRIES = 3
 BASE_DELAY = 2  # seconds
 NETWORK_ERROR_DELAY = 30  # Longer delay for network issues
 
-# ANSI color codes (unchanged)
+# ANSI color codes
 GREEN = '\033[92m'
 RED = '\033[91m'
+YELLOW = '\033[93m'
 RESET = '\033[0m'
 
-# Add YELLOW for warnings
-YELLOW = '\033[93m'
+def setup_environment():
+    """Create necessary folders and files."""
+    if not os.path.exists(PROCESSED_FOLDER):
+        os.makedirs(PROCESSED_FOLDER)
+    # Clear output files at start
+    open(HITS_MINIMAL, "w").close()
+    open(HITS_VERBOSE, "w").close()
 
-# Read all GitHub tokens (unchanged)
 def get_github_tokens():
+    """Read all GitHub tokens from token file."""
+    if not os.path.exists(GITHUB_TOKEN_FILE):
+        print(f"{RED}[!] Token file {GITHUB_TOKEN_FILE} not found{RESET}")
+        exit(1)
+    
     with open(GITHUB_TOKEN_FILE, "r") as f:
         tokens = [line.strip() for line in f if line.strip()]
     return tokens
@@ -47,31 +59,31 @@ def get_headers():
         "Accept": "application/vnd.github.v3+json",
     }
 
-def get_search_urls_from_files():
-    """Collect ALL GitHub search URLs from all .txt files except the token file."""
+def get_search_files():
+    """Get all .txt files containing search URLs, except the token file."""
+    return [f for f in os.listdir(".") 
+            if f.endswith(".txt") 
+            and f != GITHUB_TOKEN_FILE
+            and f != HITS_MINIMAL
+            and f != HITS_VERBOSE]
+
+def get_urls_from_file(filename):
+    """Get all search URLs from a single file."""
     urls = set()
-    for filename in os.listdir("."):
-        if filename.endswith(".txt") and filename != GITHUB_TOKEN_FILE:
-            with open(filename, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("https://github.com/search?q="):
-                        urls.add(line)
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("https://github.com/search?q="):
+                urls.add(line)
     return sorted(urls)
 
 def extract_github_search_query(url):
-    """
-    Extract and clean the `q` parameter from a GitHub search URL.
-    Fixes encoding issues like 'in:url%22107...' to 'in:url:107...'.
-    """
+    """Extract and clean the search query from a GitHub URL."""
     parsed_url = urlparse(url)
     query_params = parse_qs(parsed_url.query)
     raw_query = query_params.get("q", [""])[0]
-    
     decoded_query = unquote_plus(raw_query)
-    
     decoded_query = re.sub(r'in:url"?([^\s"]+)"?', r'in:url:\1', decoded_query)
-    
     return decoded_query
 
 def log_hit_verbose(query, total_count, results):
@@ -90,35 +102,32 @@ def log_hit_minimal(url):
 def check_rate_limit():
     """Check remaining rate limit and reset time."""
     try:
-        resp = requests.get("https://api.github.com/rate_limit", headers=get_headers(), timeout=10)
+        resp = requests.get("https://api.github.com/rate_limit", 
+                          headers=get_headers(), 
+                          timeout=10)
         if resp.status_code == 401:
             rotate_token()
             return check_rate_limit()
         resp.raise_for_status()
         data = resp.json()
-        core = data["resources"]["core"]
         search = data["resources"]["search"]
-        return (
-            search["remaining"],  # Search-specific remaining calls
-            search["reset"],      # Search reset time
-            core["remaining"],    # Core remaining calls (for non-search API)
-        )
+        return search["remaining"], search["reset"]
     except requests.exceptions.Timeout:
         print(f"{YELLOW}[!] Timeout while checking rate limit{RESET}")
-        return 0, time.time() + 60, 0
+        return 0, time.time() + 60
     except requests.exceptions.ConnectionError:
         print(f"{YELLOW}[!] Connection error while checking rate limit{RESET}")
-        return 0, time.time() + 60, 0
+        return 0, time.time() + 60
     except Exception as e:
         print(f"{RED}[!] Rate limit check failed: {e}{RESET}")
-        return 0, time.time() + 60, 0  # Fallback values
+        return 0, time.time() + 60
 
 def is_network_error(e):
     """Check if the exception is a network-related error."""
     network_errors = (
         requests.exceptions.ConnectionError,
         requests.exceptions.Timeout,
-        socket.gaierror,  # For DNS resolution errors
+        socket.gaierror,
     )
     return isinstance(e, network_errors)
 
@@ -134,23 +143,17 @@ def github_search(url, retry=0):
             return None
 
         api_url = "https://api.github.com/search/code"
-        response = requests.get(api_url, headers=get_headers(), params={"q": query}, timeout=10)
+        response = requests.get(api_url, 
+                              headers=get_headers(), 
+                              params={"q": query}, 
+                              timeout=10)
         
-        # Handle authentication errors
         if response.status_code == 401:
             rotate_token()
             return github_search(url, retry + 1)
         
-        # Handle rate limits
         if response.status_code == 403:
-            # Check if it's an abuse rate limit
-            if 'Retry-After' in response.headers:
-                sleep_time = int(response.headers['Retry-After'])
-            else:
-                # Standard rate limit
-                remaining, reset_time, _ = check_rate_limit()
-                sleep_time = max(reset_time - time.time(), 0) + 5
-            
+            sleep_time = int(response.headers.get('Retry-After', 60))
             print(f"{RED}[!] Rate limit triggered. Sleeping {sleep_time}s...{RESET}")
             time.sleep(sleep_time)
             return github_search(url, retry + 1)
@@ -160,39 +163,29 @@ def github_search(url, retry=0):
     
     except requests.exceptions.RequestException as e:
         if is_network_error(e):
-            print(f"{YELLOW}[!] Network error searching '{query}': {e}{RESET}")
+            print(f"{YELLOW}[!] Network error searching '{url}': {e}{RESET}")
             sleep_time = NETWORK_ERROR_DELAY * (retry + 1)
             print(f"{YELLOW}[!] Waiting {sleep_time}s before retry...{RESET}")
             time.sleep(sleep_time)
         else:
-            print(f"{RED}[!] Error searching '{query}': {e}{RESET}")
-            time.sleep(BASE_DELAY * (retry + 1))  # Exponential backoff
-        
+            print(f"{RED}[!] Error searching '{url}': {e}{RESET}")
+            time.sleep(BASE_DELAY * (retry + 1))
         return github_search(url, retry + 1)
     except Exception as e:
-        print(f"{RED}[!] Unexpected error searching '{query}': {e}{RESET}")
+        print(f"{RED}[!] Unexpected error searching '{url}': {e}{RESET}")
         time.sleep(BASE_DELAY * (retry + 1))
         return github_search(url, retry + 1)
 
-if __name__ == "__main__":
-    if not GITHUB_TOKENS:
-        print(f"{RED}[!] No tokens found in {GITHUB_TOKEN_FILE}{RESET}")
-        exit(1)
-        
-    print(f"[*] Starting scan with {len(GITHUB_TOKENS)} tokens available")
+def process_file(filename):
+    """Process all URLs in a single file."""
+    print(f"\n{GREEN}[*] Processing file: {filename}{RESET}")
+    urls = get_urls_from_file(filename)
+    print(f"[*] Found {len(urls)} search URLs in this file.")
     
-    # Clear output files
-    open(HITS_MINIMAL, "w").close()
-    open(HITS_VERBOSE, "w").close()
-
-    search_urls = get_search_urls_from_files()
-    print(f"[*] Found {len(search_urls)} unique search URLs.")
-
-    for url in search_urls:
+    for url in urls:
         try:
-            remaining, reset_time, _ = check_rate_limit()
+            remaining, reset_time = check_rate_limit()
             
-            # Pre-emptive rate limit handling
             if remaining <= 1:
                 sleep_time = max(reset_time - time.time(), 0) + 5
                 print(f"{RED}[!] Approaching rate limit. Sleeping {sleep_time:.1f}s...{RESET}")
@@ -209,15 +202,44 @@ if __name__ == "__main__":
             else:
                 print(f"[-] No results.")
             
-            time.sleep(BASE_DELAY)  # Default delay between queries
+            time.sleep(BASE_DELAY)
         
         except KeyboardInterrupt:
-            print(f"\n{YELLOW}[!] Script interrupted by user. Exiting gracefully...{RESET}")
-            break
+            print(f"\n{YELLOW}[!] Processing interrupted by user{RESET}")
+            return False  # Signal that processing wasn't completed
         except Exception as e:
-            print(f"{RED}[!] Fatal error processing URL {url}: {e}{RESET}")
-            print(f"{YELLOW}[!] Continuing with next URL...{RESET}")
-            time.sleep(BASE_DELAY)
+            print(f"{RED}[!] Error processing URL {url}: {e}{RESET}")
             continue
+    
+    return True  # Signal that processing completed successfully
+
+def move_to_processed(filename):
+    """Move a completed file to the processed folder."""
+    try:
+        dest = os.path.join(PROCESSED_FOLDER, filename)
+        shutil.move(filename, dest)
+        print(f"{GREEN}[*] Moved {filename} to {PROCESSED_FOLDER}{RESET}")
+    except Exception as e:
+        print(f"{RED}[!] Error moving file {filename}: {e}{RESET}")
+
+if __name__ == "__main__":
+    setup_environment()
+    
+    if not GITHUB_TOKENS:
+        print(f"{RED}[!] No valid tokens found in {GITHUB_TOKEN_FILE}{RESET}")
+        exit(1)
+        
+    print(f"[*] Starting scan with {len(GITHUB_TOKENS)} tokens available")
+    
+    search_files = get_search_files()
+    print(f"[*] Found {len(search_files)} files to process")
+    
+    for filename in search_files:
+        completed = process_file(filename)
+        if completed:
+            move_to_processed(filename)
+        else:
+            print(f"{YELLOW}[!] Stopping processing (user interrupt){RESET}")
+            break
 
     print("[*] Scan complete.")
