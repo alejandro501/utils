@@ -113,10 +113,10 @@ def check_rate_limit():
         search = data["resources"]["search"]
         return search["remaining"], search["reset"]
     except requests.exceptions.Timeout:
-        print(f"{YELLOW}[!] Timeout while checking rate limit{RESET}")
+        print(f"{RED}[!] Timeout while checking rate limit{RESET}")
         return 0, time.time() + 60
     except requests.exceptions.ConnectionError:
-        print(f"{YELLOW}[!] Connection error while checking rate limit{RESET}")
+        print(f"{RED}[!] Connection error while checking rate limit{RESET}")
         return 0, time.time() + 60
     except Exception as e:
         print(f"{RED}[!] Rate limit check failed: {e}{RESET}")
@@ -163,7 +163,7 @@ def github_search(url, retry=0):
     
     except requests.exceptions.RequestException as e:
         if is_network_error(e):
-            print(f"{YELLOW}[!] Network error searching '{url}': {e}{RESET}")
+            print(f"{RED}[!] Network error searching '{url}': {e}{RESET}")
             sleep_time = NETWORK_ERROR_DELAY * (retry + 1)
             print(f"{YELLOW}[!] Waiting {sleep_time}s before retry...{RESET}")
             time.sleep(sleep_time)
@@ -178,7 +178,7 @@ def github_search(url, retry=0):
 
 def process_file(filename):
     """Process all URLs in a single file."""
-    print(f"\n{GREEN}[*] Processing file: {filename}{RESET}")
+    print(f"\n{YELLOW}[*] Processing file: {filename}{RESET}")
     urls = get_urls_from_file(filename)
     print(f"[*] Found {len(urls)} search URLs in this file.")
     
@@ -188,7 +188,7 @@ def process_file(filename):
             
             if remaining <= 1:
                 sleep_time = max(reset_time - time.time(), 0) + 5
-                print(f"{RED}[!] Approaching rate limit. Sleeping {sleep_time:.1f}s...{RESET}")
+                print(f"{YELLOW}[!] Approaching rate limit. Sleeping {sleep_time:.1f}s...{RESET}")
                 time.sleep(sleep_time)
 
             query = extract_github_search_query(url)
@@ -218,7 +218,7 @@ def move_to_processed(filename):
     try:
         dest = os.path.join(PROCESSED_FOLDER, filename)
         shutil.move(filename, dest)
-        print(f"{GREEN}[*] Moved {filename} to {PROCESSED_FOLDER}{RESET}")
+        print(f"{YELLOW}[*] Moved {filename} to {PROCESSED_FOLDER}{RESET}")
     except Exception as e:
         print(f"{RED}[!] Error moving file {filename}: {e}{RESET}")
 
@@ -243,3 +243,4 @@ if __name__ == "__main__":
             break
 
     print("[*] Scan complete.")
+
