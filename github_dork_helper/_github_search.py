@@ -2,22 +2,27 @@ import os
 import re
 import requests
 import time
+import socket
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs, unquote_plus  # Added this import
+from urllib.parse import urlparse, parse_qs, unquote_plus
 
-# Configuration
+# Configuration (unchanged)
 GITHUB_TOKEN_FILE = "_github_token.txt"
-HITS_MINIMAL = "_hits.txt"  # Fixed typo from HITS_MINIMAL to HITS_MINIMAL
+HITS_MINIMAL = "_hits.txt"
 HITS_VERBOSE = "_hits_verbose.txt"
 MAX_RETRIES = 3
 BASE_DELAY = 2  # seconds
+NETWORK_ERROR_DELAY = 30  # Longer delay for network issues
 
-# ANSI color codes
+# ANSI color codes (unchanged)
 GREEN = '\033[92m'
 RED = '\033[91m'
 RESET = '\033[0m'
 
-# Read all GitHub tokens
+# Add YELLOW for warnings
+YELLOW = '\033[93m'
+
+# Read all GitHub tokens (unchanged)
 def get_github_tokens():
     with open(GITHUB_TOKEN_FILE, "r") as f:
         tokens = [line.strip() for line in f if line.strip()]
@@ -77,16 +82,15 @@ def log_hit_verbose(query, total_count, results):
             f.write(f"- {item['html_url']}\n")
         f.write(f"Time: {datetime.now()}\n")
 
-def log_hit_minimal(results):
-    """Log only URLs to minimal file."""
+def log_hit_minimal(url):
+    """Log only the original search URL to minimal file."""
     with open(HITS_MINIMAL, "a") as f:
-        for item in results:
-            f.write(f"{item['html_url']}\n")
+        f.write(f"{url}\n")
 
 def check_rate_limit():
     """Check remaining rate limit and reset time."""
     try:
-        resp = requests.get("https://api.github.com/rate_limit", headers=get_headers())
+        resp = requests.get("https://api.github.com/rate_limit", headers=get_headers(), timeout=10)
         if resp.status_code == 401:
             rotate_token()
             return check_rate_limit()
@@ -99,9 +103,24 @@ def check_rate_limit():
             search["reset"],      # Search reset time
             core["remaining"],    # Core remaining calls (for non-search API)
         )
+    except requests.exceptions.Timeout:
+        print(f"{YELLOW}[!] Timeout while checking rate limit{RESET}")
+        return 0, time.time() + 60, 0
+    except requests.exceptions.ConnectionError:
+        print(f"{YELLOW}[!] Connection error while checking rate limit{RESET}")
+        return 0, time.time() + 60, 0
     except Exception as e:
         print(f"{RED}[!] Rate limit check failed: {e}{RESET}")
         return 0, time.time() + 60, 0  # Fallback values
+
+def is_network_error(e):
+    """Check if the exception is a network-related error."""
+    network_errors = (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        socket.gaierror,  # For DNS resolution errors
+    )
+    return isinstance(e, network_errors)
 
 def github_search(url, retry=0):
     """Execute GitHub search using the exact URL query."""
@@ -115,7 +134,7 @@ def github_search(url, retry=0):
             return None
 
         api_url = "https://api.github.com/search/code"
-        response = requests.get(api_url, headers=get_headers(), params={"q": query})
+        response = requests.get(api_url, headers=get_headers(), params={"q": query}, timeout=10)
         
         # Handle authentication errors
         if response.status_code == 401:
@@ -124,7 +143,14 @@ def github_search(url, retry=0):
         
         # Handle rate limits
         if response.status_code == 403:
-            sleep_time = 60  # Wait 1 minute for abuse rate limit
+            # Check if it's an abuse rate limit
+            if 'Retry-After' in response.headers:
+                sleep_time = int(response.headers['Retry-After'])
+            else:
+                # Standard rate limit
+                remaining, reset_time, _ = check_rate_limit()
+                sleep_time = max(reset_time - time.time(), 0) + 5
+            
             print(f"{RED}[!] Rate limit triggered. Sleeping {sleep_time}s...{RESET}")
             time.sleep(sleep_time)
             return github_search(url, retry + 1)
@@ -133,8 +159,19 @@ def github_search(url, retry=0):
         return response.json()
     
     except requests.exceptions.RequestException as e:
-        print(f"{RED}[!] Error searching '{query}': {e}{RESET}")
-        time.sleep(BASE_DELAY * (retry + 1))  # Exponential backoff
+        if is_network_error(e):
+            print(f"{YELLOW}[!] Network error searching '{query}': {e}{RESET}")
+            sleep_time = NETWORK_ERROR_DELAY * (retry + 1)
+            print(f"{YELLOW}[!] Waiting {sleep_time}s before retry...{RESET}")
+            time.sleep(sleep_time)
+        else:
+            print(f"{RED}[!] Error searching '{query}': {e}{RESET}")
+            time.sleep(BASE_DELAY * (retry + 1))  # Exponential backoff
+        
+        return github_search(url, retry + 1)
+    except Exception as e:
+        print(f"{RED}[!] Unexpected error searching '{query}': {e}{RESET}")
+        time.sleep(BASE_DELAY * (retry + 1))
         return github_search(url, retry + 1)
 
 if __name__ == "__main__":
@@ -152,25 +189,35 @@ if __name__ == "__main__":
     print(f"[*] Found {len(search_urls)} unique search URLs.")
 
     for url in search_urls:
-        remaining, reset_time, _ = check_rate_limit()
-        
-        # Pre-emptive rate limit handling
-        if remaining <= 1:
-            sleep_time = max(reset_time - time.time(), 0) + 5
-            print(f"{RED}[!] Approaching rate limit. Sleeping {sleep_time:.1f}s...{RESET}")
-            time.sleep(sleep_time)
+        try:
+            remaining, reset_time, _ = check_rate_limit()
+            
+            # Pre-emptive rate limit handling
+            if remaining <= 1:
+                sleep_time = max(reset_time - time.time(), 0) + 5
+                print(f"{RED}[!] Approaching rate limit. Sleeping {sleep_time:.1f}s...{RESET}")
+                time.sleep(sleep_time)
 
-        query = extract_github_search_query(url)
-        print(f"[>] Executing: {query}")
-        result = github_search(url)
+            query = extract_github_search_query(url)
+            print(f"[>] Executing: {query}")
+            result = github_search(url)
+            
+            if result and "total_count" in result and result["total_count"] > 0:
+                print(f"{GREEN}[+] Found {result['total_count']} results!{RESET}")
+                log_hit_verbose(query, result["total_count"], result["items"])
+                log_hit_minimal(url)
+            else:
+                print(f"[-] No results.")
+            
+            time.sleep(BASE_DELAY)  # Default delay between queries
         
-        if result and "total_count" in result and result["total_count"] > 0:
-            print(f"{GREEN}[+] Found {result['total_count']} results!{RESET}")
-            log_hit_verbose(query, result["total_count"], result["items"])
-            log_hit_minimal(result["items"])
-        else:
-            print(f"[-] No results.")
-        
-        time.sleep(BASE_DELAY)  # Default delay between queries
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}[!] Script interrupted by user. Exiting gracefully...{RESET}")
+            break
+        except Exception as e:
+            print(f"{RED}[!] Fatal error processing URL {url}: {e}{RESET}")
+            print(f"{YELLOW}[!] Continuing with next URL...{RESET}")
+            time.sleep(BASE_DELAY)
+            continue
 
     print("[*] Scan complete.")
